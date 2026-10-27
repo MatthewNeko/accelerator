@@ -39,6 +39,21 @@ native bool Accelerator_IsDoneUploadingCrashes();
 native void Accelerator_GetCrashHTTPResponse(int index, char[] buffer, int size);
 
 /**
+ * Writes the live SourcePawn call stack into buffer, one frame per line.
+ *
+ * The frames are the VM's own invoke stack, the same thing the crash handler
+ * records for a crash report. Calling this from a plugin shows the plugin's own
+ * frames, so it doubles as a way to check on a running server that this
+ * SourcePawn build exposes a usable frame iterator.
+ *
+ * @param buffer			Buffer to store the stack trace.
+ * @param size				Size of the buffer parameter.
+ * @return					Number of frames written, or -1 if the VM could not
+ *							be asked for a stack.
+ */
+native int Accelerator_GetPluginStack(char[] buffer, int size);
+
+/**
  * Do not edit below this line!
  */
 public Extension __ext_accelerator =
@@ -63,5 +78,6 @@ public __ext_accelerator_SetNTVOptional()
 	MarkNativeAsOptional("Accelerator_GetUploadedCrashCount");
 	MarkNativeAsOptional("Accelerator_IsDoneUploadingCrashes");
 	MarkNativeAsOptional("Accelerator_GetCrashHTTPResponse");
+	MarkNativeAsOptional("Accelerator_GetPluginStack");
 }
 #endif

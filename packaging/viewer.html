@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>崩溃报告看插件栈 - Accelerator SPStack 报告查看器</title>
+<style>
+	:root { color-scheme: light dark; }
+	body { font: 15px/1.5 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+		margin: 0; padding: 20px; background: #f6f7f9; color: #1c1e21; }
+	@media (prefers-color-scheme: dark) {
+		body { background: #16181c; color: #e6e8eb; }
+		.card, textarea, .frame th { background: #1f2228; border-color: #33383f; }
+		textarea, pre { color: #e6e8eb; }
+	}
+	h1 { font-size: 19px; margin: 0 0 4px; }
+	.sub { margin: 0 0 16px; opacity: .75; font-size: 13px; }
+	.card { background: #fff; border: 1px solid #dfe2e6; border-radius: 8px; padding: 14px; margin-bottom: 14px; }
+	.row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+	textarea { width: 100%; min-height: 170px; box-sizing: border-box; font: 13px/1.45 Consolas, monospace;
+		border: 1px solid #dfe2e6; border-radius: 6px; padding: 10px; background: #fff; }
+	button { font: inherit; padding: 7px 13px; border-radius: 6px; border: 1px solid #b9bec5;
+		background: #eef1f4; cursor: pointer; }
+	button.primary { background: #2f6fd0; border-color: #2f6fd0; color: #fff; }
+	.badges { display: flex; gap: 8px; flex-wrap: wrap; }
+	.badge { border: 1px solid #b9bec5; border-radius: 999px; padding: 2px 11px; font-size: 13px; }
+	.badge.warn { border-color: #b8860b; }
+	.badge.bad { border-color: #b0342c; }
+	.badge.ok { border-color: #2e7d32; }
+	table { border-collapse: collapse; width: 100%; margin-top: 8px; font-size: 14px; }
+	ul.running { margin: 4px 0 0; padding-left: 20px; font-size: 14px; }
+	ul.running li { margin: 2px 0; }
+	.frame th, .frame td { border: 1px solid #dfe2e6; padding: 6px 9px; text-align: left; vertical-align: top; }
+	.frame th { background: #f2f4f6; font-weight: 600; }
+	.kind { font-size: 12px; padding: 1px 8px; border-radius: 999px; border: 1px solid #b9bec5; white-space: nowrap; }
+	.kind.native { border-color: #2f6fd0; }
+	.kind.script { border-color: #2e7d32; }
+	.loc { font-family: Consolas, monospace; font-size: 13px; }
+	.muted { opacity: .7; }
+	pre { font: 13px/1.45 Consolas, monospace; white-space: pre-wrap; margin: 0; }
+	.note { font-size: 13px; margin: 8px 0 0; }
+	[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<h1>崩溃报告里的插件栈</h1>
+<p class="sub">把 <code>&lt;dump&gt;.dmp.txt</code> 整份贴进来（或只贴 <code>SOURCEPAWN STACK</code> 那一段）。
+本地解析，不联网、不上传、不写文件。</p>
+
+<div class="card">
+	<label for="raw" class="muted">报告原文</label>
+	<textarea id="raw" spellcheck="false" placeholder="-------- SOURCEPAWN STACK BEGIN --------&#10;..."></textarea>
+	<div class="row" style="margin-top:10px">
+		<button class="primary" id="go">解析</button>
+		<button id="sample">载入实测样例</button>
+		<span class="muted" id="src"></span>
+	</div>
+</div>
+
+<div class="card" id="out" hidden>
+	<div class="badges" id="badges"></div>
+	<div id="blame"></div>
+	<div id="running"></div>
+	<table class="frame" id="table" hidden>
+		<thead><tr><th>#</th><th>类型</th><th>函数</th><th>位置</th><th>插件</th><th>说明</th></tr></thead>
+		<tbody id="rows"></tbody>
+	</table>
+	<p class="note muted" id="explain"></p>
+</div>
+
+<script>
+/* BEGIN PARSER — tests/check_viewer.mjs 会抽出这一段单独跑，不依赖本页任何 DOM */
+function parseSpStack(text) {
+	var BEGIN = "-------- SOURCEPAWN STACK BEGIN --------";
+	var END = "-------- SOURCEPAWN STACK END --------";
+	var result = {
+		found: false, complete: false, vmVersion: "", vmThread: "", crashThread: "",
+		framesCount: null, framesUnknown: false, statuses: [], notes: [], caveats: [],
+		truncations: [], legend: "", frames: [], orphan: [], mismatch: "",
+		running: [], runningDeclared: null, runningOverflow: 0
+	};
+	if (!text) return result;
+
+	var start = text.indexOf(BEGIN);
+	if (start < 0) return result;
+	result.found = true;
+	var body = text.slice(start + BEGIN.length);
+	var end = body.indexOf(END);
+	if (end >= 0) {
+		result.complete = true;
+		body = body.slice(0, end);
+	}
+
+	body.split(/\r?\n/).forEach(function (line) {
+		var m;
+		if (!line.trim()) return;
+		if ((m = line.match(/^VM-Version=(.*)$/))) { result.vmVersion = m[1]; return; }
+		if ((m = line.match(/^VM-Thread=(\d+)\s+Crashed-Thread=(\d+)$/))) {
+			result.vmThread = m[1]; result.crashThread = m[2]; return;
+		}
+		if ((m = line.match(/^Frames=(\d+)$/))) { result.framesCount = Number(m[1]); return; }
+		if (/^Frames=\?/.test(line)) { result.framesUnknown = true; return; }
+		if ((m = line.match(/^Status=(.+)$/))) { result.statuses.push(m[1]); return; }
+		if ((m = line.match(/^Caveat=(.+)$/))) { result.caveats.push(m[1]); return; }
+		if ((m = line.match(/^Truncated=(.+)$/))) { result.truncations.push(m[1]); return; }
+		if ((m = line.match(/^Note=(.+)$/))) { result.notes.push(m[1]); return; }
+		if ((m = line.match(/^Legend=(.+)$/))) { result.legend = m[1]; return; }
+
+		// 插件名和文件名都可能是带空格的占位串：sp_stack.cpp 会写出
+		// "(unregistered plugin)" 和 "(unknown file)"，所以这几个字段不能用 \S+。
+		if ((m = line.match(/^\[(\d+)\]\s+native\s+"([^"]*)"\s+called-by=(.+)$/))) {
+			result.frames.push({ index: Number(m[1]), kind: "native", name: m[2], plugin: m[3] });
+			return;
+		}
+		if ((m = line.match(/^\[(\d+)\]\s+script\s+"([^"]*)"\s+(.+?):(\d+)\s+plugin=(.+?)(?:\s+note=(.+))?$/))) {
+			result.frames.push({
+				index: Number(m[1]), kind: "script", name: m[2], file: m[3], line: Number(m[4]),
+				plugin: m[5], note: m[6] || ""
+			});
+			return;
+		}
+		if ((m = line.match(/^\[(\d+)\]\s+internal\s+\((.*)\)$/))) {
+			result.frames.push({ index: Number(m[1]), kind: "internal", name: "(VM 自己的辅助帧)", plugin: m[2] });
+			return;
+		}
+
+		// Per-plugin summary of the scripted frames above.
+		if ((m = line.match(/^Running-Plugins=(\d+)(?:\s+\(\+(\d+) more not listed\))?$/))) {
+			result.runningDeclared = Number(m[1]);
+			result.runningOverflow = m[2] ? Number(m[2]) : 0;
+			return;
+		}
+		if ((m = line.match(/^plugin=(.+?) frames=(\d+) functions="(.*)"(?: \(truncated\))?$/))) {
+			result.running.push({ plugin: m[1], frames: Number(m[2]), functions: m[3] });
+			return;
+		}
+		result.orphan.push(line);
+	});
+
+	// 交叉核对：声明的帧数和列出来的帧数不一致，而段又自称完整、也没说被截断，
+	// 那多半是贴漏了或者被改过。截断的情形不算，那时两边本来就该不等。
+	if (result.complete && !result.truncations.length && result.framesCount !== null
+			&& result.frames.length !== result.framesCount) {
+		result.mismatch = "Frames=" + result.framesCount + " 但只列出 " + result.frames.length +
+			" 帧：贴进来的内容可能被截断或改过";
+	}
+
+	return result;
+}
+
+/* 谁最可疑：脚本帧里出现次数最多的插件。这是归因提示，不是结论。 */
+function blamePlugins(parsed) {
+	var counts = {};
+	parsed.frames.forEach(function (f) {
+		if (f.kind !== "script" || !f.plugin) return;
+		counts[f.plugin] = (counts[f.plugin] || 0) + 1;
+	});
+	return Object.keys(counts).sort(function (a, b) { return counts[b] - counts[a]; })
+		.map(function (p) { return { plugin: p, hits: counts[p] }; });
+}
+
+function describeStatus(parsed) {
+	if (!parsed.found) {
+		return { level: "none", text: "这份报告里没有 SOURCEPAWN STACK 段" };
+	}
+	if (!parsed.complete) {
+		return { level: "bad", text: "段没写完（缺 END 行）：走栈过程本身被打断了" };
+	}
+	if (parsed.statuses.indexOf("walk-faulted") >= 0) {
+		return { level: "bad", text: "读插件栈时又出了一次异常；dump 本身仍然有效" };
+	}
+	if (parsed.statuses.indexOf("no-plugin-contexts") >= 0) {
+		return { level: "warn", text: "扩展手上没有已加载插件的上下文可问虚拟机" };
+	}
+	if (parsed.statuses.indexOf("iterator-unavailable") >= 0) {
+		return { level: "warn", text: "虚拟机不肯给帧迭代器" };
+	}
+	if (parsed.statuses.indexOf("vm-idle") >= 0) {
+		return { level: "ok", text: "崩溃时虚拟机是空的：这次没有插件在跑" };
+	}
+	if (parsed.frames.length) {
+		return { level: "warn", text: "有插件栈：最上面那帧就是出事时正在执行的东西" };
+	}
+	return { level: "warn", text: "段完整但一帧都没有，而且没给原因" };
+}
+/* END PARSER */
+
+if (typeof document !== "undefined") {
+	var SAMPLE = [
+		"-------- SOURCEPAWN STACK BEGIN --------",
+		"VM-Version=standalone VM host",
+		"VM-Thread=938 Crashed-Thread=938",
+		"Frames=5",
+		'[0] native   "AccelProbeCrash"  called-by=accel_probe.smx',
+		'[1] script   "InnerTwo"  accel_probe.sp:12  plugin=accel_probe.smx',
+		'[2] script   "InnerOne"  accel_probe.sp:17  plugin=accel_probe.smx',
+		'[3] script   "AccelProbeMain"  accel_probe.sp:22  plugin=accel_probe.smx',
+		"[4] internal (accel_probe.smx)",
+		"Running-Plugins=1",
+		'plugin=accel_probe.smx frames=3 functions="InnerTwo <- InnerOne <- AccelProbeMain"',
+		"Legend=native=engine/extension function, script=plugin code with file:line, internal=VM helper frame",
+		"-------- SOURCEPAWN STACK END --------"
+	].join("\n");
+
+	var esc = function (s) {
+		return String(s).replace(/[&<>"]/g, function (c) {
+			return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+		});
+	};
+
+	function render(parsed) {
+		var badges = document.getElementById("badges");
+		var rows = document.getElementById("rows");
+		var verdict = describeStatus(parsed);
+		var html = '<span class="badge ' + (verdict.level === "none" ? "" : verdict.level) + '">' +
+			esc(verdict.text) + "</span>";
+
+		if (parsed.found) {
+			html += '<span class="badge">Frames=' +
+				(parsed.framesUnknown ? "?（没数出来）" : parsed.framesCount) + "</span>";
+			if (parsed.vmVersion) html += '<span class="badge">VM-Version=' + esc(parsed.vmVersion) + "</span>";
+			if (parsed.vmThread && parsed.vmThread !== parsed.crashThread) {
+				html += '<span class="badge warn">线程不一致：VM=' + esc(parsed.vmThread) +
+					" 崩溃=" + esc(parsed.crashThread) + "</span>";
+			}
+			parsed.truncations.forEach(function (t) {
+				html += '<span class="badge warn">Truncated=' + esc(t) + "</span>";
+			});
+			if (parsed.mismatch) {
+				html += '<span class="badge bad">' + esc(parsed.mismatch) + "</span>";
+			}
+		}
+		badges.innerHTML = html;
+
+		var blame = document.getElementById("blame");
+		var culprits = blamePlugins(parsed);
+		if (culprits.length) {
+			blame.innerHTML = '<p class="note">脚本帧里的插件出现次数：' +
+				culprits.map(function (c) { return esc(c.plugin) + " ×" + c.hits; }).join("，") +
+				' <span class="muted">（提示，不是结论：外层帧也可能是被无辜牵连的调用者）</span></p>';
+		} else {
+			blame.innerHTML = "";
+		}
+
+		var runningBox = document.getElementById("running");
+		if (parsed.running.length) {
+			var items = parsed.running.map(function (r) {
+				return "<li><span class=\"loc\">" + esc(r.plugin) + "</span> · " +
+					r.frames + " 帧 · " + esc(r.functions) + "</li>";
+			}).join("");
+			runningBox.innerHTML = '<p class="note">崩溃时正在运行的插件函数（按插件归组，栈内自内向外）：</p>' +
+				'<ul class="running">' + items + "</ul>" +
+				(parsed.runningOverflow
+					? '<p class="note muted">另有 ' + parsed.runningOverflow + " 个插件没列出（超过上限）</p>"
+					: "");
+		} else {
+			runningBox.innerHTML = "";
+		}
+
+		rows.innerHTML = parsed.frames.map(function (f) {
+			var where = f.kind === "script"
+				? '<span class="loc">' + esc(f.file) + ":" + f.line + "</span>"
+				: (f.kind === "native" ? '<span class="muted">引擎/扩展代码</span>' : '<span class="muted">—</span>');
+			return "<tr><td>" + f.index + "</td>" +
+				'<td><span class="kind ' + f.kind + '">' + f.kind + "</span></td>" +
+				"<td>" + esc(f.name) + "</td><td>" + where + "</td>" +
+				"<td>" + esc(f.plugin || "") + "</td>" +
+				"<td>" + esc(f.note || "") + "</td></tr>";
+		}).join("");
+		document.getElementById("table").hidden = parsed.frames.length === 0;
+
+		var extra = [];
+		parsed.notes.forEach(function (n) { extra.push("Note: " + n); });
+		parsed.caveats.forEach(function (c) { extra.push("Caveat: " + c); });
+		if (parsed.orphan.length) {
+			extra.push("解析不了的行：" + parsed.orphan.join(" | ") +
+				"（工具与本格式的期望不一致，请把这一段反馈出来）");
+		}
+		var explain = document.getElementById("explain");
+		explain.textContent = extra.join("\n");
+		explain.style.whiteSpace = "pre-wrap";
+		document.getElementById("out").hidden = false;
+	}
+
+	document.getElementById("go").addEventListener("click", function () {
+		document.getElementById("src").textContent = "";
+		render(parseSpStack(document.getElementById("raw").value));
+	});
+	document.getElementById("sample").addEventListener("click", function () {
+		document.getElementById("raw").value = SAMPLE;
+		document.getElementById("src").textContent = "这是本机实测打出来的原始报告";
+		render(parseSpStack(SAMPLE));
+	});
+}
+</script>
+</body>
+</html>

@@ -9,6 +9,9 @@ project.sources = [
   'MemoryDownloader.cpp',
   'forwards.cpp',
   'natives.cpp',
+  'sp_stack.cpp',
+  'console_tail.cpp',
+  'spew_capture.cpp',
   os.path.join(Accelerator.sm_root, 'public', 'smsdk_ext.cpp')
 ]
 

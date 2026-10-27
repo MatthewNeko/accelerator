@@ -115,7 +115,11 @@ class AcceleratorConfig(object):
       '-fno-threadsafe-statics',
       '-Wno-non-virtual-dtor',
       '-Wno-overloaded-virtual',
-      '-Wno-implicit-exception-spec-mismatch'
+      '-Wno-implicit-exception-spec-mismatch',
+      # breakpad's module writer still uses std::get_temporary_buffer, which
+      # libstdc++ >= 12 marks deprecated; with -Werror that stops any modern
+      # toolchain from building the vendored breakpad at all.
+      '-Wno-deprecated-declarations'
     ]
 
     cxx.postlink += ['-pthread', '-Wl,-z,noexecstack']

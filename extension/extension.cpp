@@ -29,6 +29,9 @@
 #include "MemoryDownloader.h"
 #include "forwards.h"
 #include "natives.h"
+#include "sp_stack.h"
+#include "console_tail.h"
+#include "spew_capture.h"
 
 #if defined _LINUX
 #include "client/linux/handler/exception_handler.h"
@@ -126,6 +129,15 @@ GetSpewFastcall_t GetSpewFastcall;
 
 char spewBuffer[65536]; // Hi.
 
+// How much of the engine's console history a report keeps. The buffer can hold
+// tens of thousands of lines; the tail is where the crash is.
+static const int kConsoleTailLines = 500;
+
+// Why console history is missing, if it is. Set once while loading, read from the
+// crash callback; ever only points at a string literal, which is all that is safe
+// to touch in a signal handler.
+const char *spewFailure = "the GetSpew signature did not match this engine build";
+
 char crashMap[256];
 char crashGamePath[512];
 char crashCommandLine[1024];
@@ -136,8 +148,125 @@ char steamInf[1024];
 
 char dumpStoragePath[512];
 char logPath[512];
+char crashArchivePath[512];
+
+// Static, not stack: the Linux dump callback runs on breakpad's alternate
+// signal stack, which is far too small for a report buffer.
+char spStackBuffer[32768];
+
+// Console lines collected by our logging listener, copied out of its ring when
+// a report is written. Same signal-stack reason as spStackBuffer.
+char consoleCaptureBuffer[65536];
+
+// What the report should say about console history, decided once per crash.
+struct ConsoleHistoryForReport
+{
+	const char *text;
+	size_t length;
+	int kept;
+	int held;
+	bool tailKept;
+	bool fromListener;
+};
+
+ConsoleHistoryForReport consoleHistory;
+
+/**
+ * @brief Chooses the console history a report will carry.
+ *
+ * Two sources, in order: our own logging ring (chronological, and the only one
+ * that still works on builds whose GetSpew history is never filled) and the
+ * engine's GetSpew history (which can include output from before this
+ * extension loaded, notably on Windows). The destination is static, so this is
+ * safe to call from the crash callback.
+ */
+static void CollectConsoleHistory()
+{
+	consoleHistory = ConsoleHistoryForReport();
+
+	if (GetSpew) {
+		GetSpew(spewBuffer, sizeof(spewBuffer));
+	}
+#if defined _WINDOWS
+	else if (GetSpewFastcall) {
+		GetSpewFastcall(spewBuffer, sizeof(spewBuffer));
+	}
+#endif
+
+	if (spewcapture::Installed()) {
+		spewcapture::Tail tail;
+		size_t length = spewcapture::CopyTail(consoleCaptureBuffer,
+			sizeof(consoleCaptureBuffer), kConsoleTailLines, &tail);
+		if (length) {
+			consoleHistory.text = consoleCaptureBuffer;
+			consoleHistory.length = length;
+			consoleHistory.kept = tail.kept;
+			consoleHistory.held = tail.held;
+			consoleHistory.tailKept = tail.cut;
+			consoleHistory.fromListener = true;
+			return;
+		}
+	}
+
+	if ((GetSpew
+#if defined _WINDOWS
+		|| GetSpewFastcall
+#endif
+		) && spewBuffer[0]) {
+		size_t length = 0;
+		while (spewBuffer[length]) {
+			++length;
+		}
+		consoletail::Range tail = consoletail::Last(spewBuffer, length, kConsoleTailLines);
+
+		consoleHistory.text = spewBuffer + tail.start;
+		consoleHistory.length = tail.length;
+		consoleHistory.kept = tail.kept;
+		consoleHistory.held = tail.total;
+		consoleHistory.tailKept = tail.kept < tail.total;
+		consoleHistory.fromListener = false;
+	}
+}
+
+/** @brief Whether the engine exposes GetSpew at all on this platform. */
+static bool HaveEngineConsoleHistory()
+{
+#if defined _WINDOWS
+	return GetSpew != NULL || GetSpewFastcall != NULL;
+#else
+	return GetSpew != NULL;
+#endif
+}
+
+// Whether to walk the SourcePawn VM stack inside the crash callback.
+bool captureSourcePawnStack = true;
+
+// Whether to keep a copy of each crash report locally after uploading it.
+bool keepCrashReports = true;
 
 google_breakpad::ExceptionHandler *handler = NULL;
+
+/**
+ * @brief Collects the SourcePawn stack section for a crash report.
+ *
+ * Only ever called from a dump callback, after the minidump itself is on disk.
+ * Everything the section needs (the VM stack, the plugin names) only exists
+ * inside the dying process, which is why it cannot be recovered later from the
+ * minidump alone: the VM's frames are not machine frames and the JIT regions
+ * plugin code runs in belong to no module breakpad can symbolize.
+ *
+ * @return	Number of bytes written to spStackBuffer, 0 when disabled.
+ */
+static size_t CollectSourcePawnStackReport()
+{
+	if (!captureSourcePawnStack) {
+		spStackBuffer[0] = '\0';
+		return 0;
+	}
+
+	return spstack::WriteCrashReport(spStackBuffer, sizeof(spStackBuffer),
+		crashSourceModVersion[0] ? crashSourceModVersion : nullptr);
+}
 
 #if defined _LINUX
 void terminateHandler()
@@ -168,6 +297,30 @@ const int kExceptionSignals[] = {
 };
 
 const int kNumHandledSignals = sizeof(kExceptionSignals) / sizeof(kExceptionSignals[0]);
+
+// sys_write needs an explicit length, so literals go through this instead of
+// hand-counted numbers that rot when a word changes.
+static void SysWriteLiteral(int fd, const char *text)
+{
+	sys_write(fd, text, my_strlen(text));
+}
+
+// Async-signal-safe integer output. sys_write takes bytes; building the digits
+// backwards and emitting them one call at a time avoids both printf and a
+// temporary buffer whose size someone would later get wrong.
+static void SysWriteUnsigned(int fd, unsigned value)
+{
+	char digits[16];
+	size_t count = 0;
+	do {
+		digits[count++] = static_cast<char>('0' + (value % 10));
+		value /= 10;
+	} while (value != 0 && count < sizeof(digits));
+
+	while (count > 0) {
+		sys_write(fd, &digits[--count], 1);
+	}
+}
 
 static bool dumpCallback(const google_breakpad::MinidumpDescriptor& descriptor, void* context, bool succeeded)
 {
@@ -217,14 +370,56 @@ static bool dumpCallback(const google_breakpad::MinidumpDescriptor& descriptor, 
 	sys_write(extra, steamInf, my_strlen(steamInf));
 	sys_write(extra, "\n-------- CONFIG END --------\n", 30);
 
-	if (GetSpew) {
-		GetSpew(spewBuffer, sizeof(spewBuffer));
+	CollectConsoleHistory();
 
-		if (my_strlen(spewBuffer) > 0) {
-			sys_write(extra, "-------- CONSOLE HISTORY BEGIN --------\n", 40);
-			sys_write(extra, spewBuffer, my_strlen(spewBuffer));
-			sys_write(extra, "-------- CONSOLE HISTORY END --------\n", 38);
+	// Console history is optional, and the section says which of the three ways
+	// it can be missing instead of silently not being there: neither source
+	// available, both empty, or the section is present but short.
+	if (consoleHistory.length) {
+		SysWriteLiteral(extra, "-------- CONSOLE HISTORY BEGIN --------\n");
+		SysWriteLiteral(extra, consoleHistory.fromListener
+			? "Source=log-listener\n" : "Source=engine-getspew\n");
+		SysWriteLiteral(extra, "Lines=");
+		SysWriteUnsigned(extra, static_cast<unsigned>(consoleHistory.kept));
+		SysWriteLiteral(extra, "/");
+		SysWriteUnsigned(extra, static_cast<unsigned>(consoleHistory.held));
+		SysWriteLiteral(extra, consoleHistory.tailKept ? " (tail kept)\n" : "\n");
+		sys_write(extra, consoleHistory.text, consoleHistory.length);
+		SysWriteLiteral(extra, "-------- CONSOLE HISTORY END --------\n");
+	} else {
+		SysWriteLiteral(extra, "-------- CONSOLE HISTORY BEGIN --------\n");
+		if (!HaveEngineConsoleHistory() && !spewcapture::Installed()) {
+			SysWriteLiteral(extra, "Status=console-unavailable\nNote=GetSpew: ");
+			sys_write(extra, spewFailure, my_strlen(spewFailure));
+			SysWriteLiteral(extra, "\nNote=log listener: ");
+			sys_write(extra, spewcapture::FailureReason(), my_strlen(spewcapture::FailureReason()));
+			SysWriteLiteral(extra, "\n");
+		} else if (HaveEngineConsoleHistory() && spewcapture::Installed()) {
+			SysWriteLiteral(extra,
+				"Status=console-empty\n"
+				"Note=both console sources were consulted and produced no lines: the "
+				"engine's GetSpew history and the extension's log listener\n");
+		} else if (HaveEngineConsoleHistory()) {
+			SysWriteLiteral(extra,
+				"Status=console-empty\n"
+				"Note=GetSpew returned nothing, and the log listener is unavailable: ");
+			sys_write(extra, spewcapture::FailureReason(), my_strlen(spewcapture::FailureReason()));
+			SysWriteLiteral(extra, "\n");
+		} else {
+			SysWriteLiteral(extra,
+				"Status=console-empty\n"
+				"Note=the log listener has not seen any output, and GetSpew is unavailable: ");
+			sys_write(extra, spewFailure, my_strlen(spewFailure));
+			SysWriteLiteral(extra, "\n");
 		}
+		SysWriteLiteral(extra, "-------- CONSOLE HISTORY END --------\n");
+	}
+
+	// Last, so that a walk which faults or hangs cannot cost us the sections
+	// above; a missing END marker in the report is itself the signal.
+	size_t spLength = CollectSourcePawnStackReport();
+	if (spLength) {
+		sys_write(extra, spStackBuffer, spLength);
 	}
 
 	sys_close(extra);
@@ -273,6 +468,12 @@ void *vectoredHandler = NULL;
 
 LONG CALLBACK BreakpadVectoredHandler(_In_ PEXCEPTION_POINTERS ExceptionInfo)
 {
+	// A fault raised while we are walking the SourcePawn stack inside
+	// dumpCallback() must not cost us a second minidump; dumpCallback's own
+	// __except block is what handles it.
+	if (spstack::IsWalking())
+		return EXCEPTION_CONTINUE_SEARCH;
+
 	switch (ExceptionInfo->ExceptionRecord->ExceptionCode)
 	{
 		case EXCEPTION_ACCESS_VIOLATION:
@@ -343,16 +544,46 @@ static bool dumpCallback(const wchar_t* dump_path,
 	fprintf(extra, "%s", steamInf);
 	fprintf(extra, "\n-------- CONFIG END --------\n");
 
-	if (GetSpew || GetSpewFastcall) {
-		if (GetSpew) {
-			GetSpew(spewBuffer, sizeof(spewBuffer));
-		} else if (GetSpewFastcall) {
-			GetSpewFastcall(spewBuffer, sizeof(spewBuffer));
-		}
+	CollectConsoleHistory();
 
-		if (spewBuffer[0]) {
-			fprintf(extra, "-------- CONSOLE HISTORY BEGIN --------\n%s-------- CONSOLE HISTORY END --------\n", spewBuffer);
+	// Same distinction as the Linux callback: unreadable and empty are different
+	// facts, and an absent section would conflate them.
+	if (consoleHistory.length) {
+		fprintf(extra, "-------- CONSOLE HISTORY BEGIN --------\nSource=%s\nLines=%d/%d%s\n",
+			consoleHistory.fromListener ? "log-listener" : "engine-getspew",
+			consoleHistory.kept, consoleHistory.held,
+			consoleHistory.tailKept ? " (tail kept)" : "");
+		fwrite(consoleHistory.text, 1, consoleHistory.length, extra);
+		fprintf(extra, "-------- CONSOLE HISTORY END --------\n");
+	} else {
+		fprintf(extra, "-------- CONSOLE HISTORY BEGIN --------\n");
+		if (!HaveEngineConsoleHistory() && !spewcapture::Installed()) {
+			fprintf(extra, "Status=console-unavailable\nNote=GetSpew: %s\nNote=log listener: %s\n",
+				spewFailure, spewcapture::FailureReason());
+		} else if (HaveEngineConsoleHistory() && spewcapture::Installed()) {
+			fprintf(extra,
+				"Status=console-empty\n"
+				"Note=both console sources were consulted and produced no lines: the "
+				"engine's GetSpew history and the extension's log listener\n");
+		} else if (HaveEngineConsoleHistory()) {
+			fprintf(extra,
+				"Status=console-empty\n"
+				"Note=GetSpew returned nothing, and the log listener is unavailable: %s\n",
+				spewcapture::FailureReason());
+		} else {
+			fprintf(extra,
+				"Status=console-empty\n"
+				"Note=the log listener has not seen any output, and GetSpew is unavailable: %s\n",
+				spewFailure);
 		}
+		fprintf(extra, "-------- CONSOLE HISTORY END --------\n");
+	}
+
+	// Last, so that a walk which faults cannot cost us the sections above; a
+	// missing END marker in the report is itself the signal.
+	size_t spLength = CollectSourcePawnStackReport();
+	if (spLength) {
+		fprintf(extra, "%s", spStackBuffer);
 	}
 
 	fclose(extra);
@@ -384,12 +615,76 @@ class UploadThread: public IThread
 	FILE *log = nullptr;
 	char serverId[38] = "";
 
+	/**
+	 * @brief Copies a crash report's metadata file into data/dumps/archive.
+	 *
+	 * The .dmp is deleted after upload and the .txt is the only surviving copy
+	 * of the SourcePawn frames, so keep it unless the server operator turned
+	 * CrashReportArchive off.
+	 *
+	 * @param metapath	Path to the report sidecar, may be empty.
+	 */
+	void ArchiveCrashReport(const char *metapath) {
+		if (!keepCrashReports || !metapath || !metapath[0]) {
+			return;
+		}
+
+		const char *base = metapath + strlen(metapath);
+		for (const char *p = metapath; *p; ++p) {
+			if (p[0] == '/' || p[0] == '\\') {
+				base = p + 1;
+			}
+		}
+		if (!base[0]) {
+			return;
+		}
+
+		char dest[512];
+		g_pSM->Format(dest, sizeof(dest), "%s/%s", crashArchivePath, base);
+
+		FILE *source = fopen(metapath, "rb");
+		if (!source) {
+			if (log) fprintf(log, "Could not open report for archiving: %s\n", metapath);
+			return;
+		}
+
+		FILE *target = fopen(dest, "wb");
+		if (!target) {
+			fclose(source);
+			if (log) fprintf(log, "Could not create archived report: %s\n", dest);
+			return;
+		}
+
+		char buffer[4096];
+		size_t read;
+		while ((read = fread(buffer, 1, sizeof(buffer), source)) > 0) {
+			if (fwrite(buffer, 1, read, target) != read) {
+				break;
+			}
+		}
+
+		fclose(source);
+		fclose(target);
+
+		if (log) {
+			fprintf(log, "Archived crash report: %s\n", dest);
+			fflush(log);
+		}
+	}
+
 	void RunThread(IThreadHandle *pHandle) {
 		rootconsole->ConsolePrint("Accelerator upload thread started.");
 
 		log = fopen(logPath, "a");
 		if (!log) {
 			g_pSM->LogError(myself, "Failed to open Accelerator log file: %s", logPath);
+		}
+
+		if (keepCrashReports && !libsys->IsPathDirectory(crashArchivePath)) {
+			if (!libsys->CreateFolder(crashArchivePath)) {
+				keepCrashReports = false;
+				g_pSM->LogError(myself, "Failed to create Accelerator report archive: %s", crashArchivePath);
+			}
 		}
 
 		char path[512];
@@ -480,6 +775,11 @@ class UploadThread: public IThread
 					if (log) fprintf(log, "Skipped due to server request\n");
 					break;
 			}
+
+			// Keep the human readable report even though the dump itself is
+			// consumed by the upload; this is the only place the SourcePawn
+			// frames ever get written.
+			ArchiveCrashReport(metapath);
 
 			if (metapath[0]) {
 				unlink(metapath);
@@ -1163,7 +1463,32 @@ bool Accelerator::SDK_OnLoad(char *error, size_t maxlength, bool late)
 		}
 	}
 
+	// Start capturing console output before anything else logs. On engine builds
+	// whose GetSpew history is never filled (CS:GO Legacy Linux), this listener
+	// is the only console source a crash report will have.
+	if (spewcapture::Install()) {
+		smutils->LogMessage(myself, "Console output is being captured for crash reports (last %d lines).",
+			kConsoleTailLines);
+	} else {
+		smutils->LogMessage(myself, "WARNING: Console capture is unavailable (%s); crash reports fall back to GetSpew.",
+			spewcapture::FailureReason());
+	}
+
 	g_pSM->BuildPath(Path_SM, logPath, sizeof(logPath), "logs/accelerator.log");
+	g_pSM->BuildPath(Path_SM, crashArchivePath, sizeof(crashArchivePath), "data/dumps/archive");
+
+	// Core config knobs, both on by default (cfg/sourcemod/sourcemod.cfg, "Core" section).
+	const char* stackOption = g_pSM->GetCoreConfigValue("CrashPluginStack");
+	captureSourcePawnStack = !stackOption
+		|| (tolower(stackOption[0]) == 'y' || stackOption[0] == '1');
+
+	const char* archiveOption = g_pSM->GetCoreConfigValue("CrashReportArchive");
+	keepCrashReports = !archiveOption
+		|| (tolower(archiveOption[0]) == 'y' || archiveOption[0] == '1');
+
+	// Remember which thread the VM lives on; crash reports say so when the
+	// crashing thread is a different one.
+	spstack::InitOnMainThread();
 
 	// Get these early so the upload thread can use them.
 	strncpy(crashGamePath, g_pSM->GetGamePath(), sizeof(crashGamePath) - 1);
@@ -1176,6 +1501,7 @@ bool Accelerator::SDK_OnLoad(char *error, size_t maxlength, bool late)
 	do {
 		char gameconfigError[256];
 		if (!gameconfs->LoadGameConfigFile("accelerator.games", &gameconfig, gameconfigError, sizeof(gameconfigError))) {
+			spewFailure = "the accelerator.games.txt gamedata file could not be loaded";
 			smutils->LogMessage(myself, "WARNING: Failed to load gamedata file, console output and command line will not be included in crash reports: %s", gameconfigError);
 			break;
 		}
@@ -1190,13 +1516,17 @@ bool Accelerator::SDK_OnLoad(char *error, size_t maxlength, bool late)
 		}
 
 		if (useFastcall && !gameconfig->GetMemSig("GetSpewFastcall", (void **)&GetSpewFastcall)) {
+			spewFailure = "the GetSpewFastcall signature did not match this engine build";
 			smutils->LogMessage(myself, "WARNING: GetSpewFastcall not found in gamedata, console output will not be included in crash reports.");
 			break;
 		}
 #endif
 
 		if (!useFastcall && !gameconfig->GetMemSig("GetSpew", (void **)&GetSpew)) {
-			smutils->LogMessage(myself, "WARNING: GetSpew not found in gamedata, console output will not be included in crash reports.");
+			spewFailure = "the GetSpew signature did not match this engine build";
+			// The game folder decides which gamedata section applies, so name it: the
+			// signature can be fine and the section still never get selected.
+			smutils->LogMessage(myself, "WARNING: GetSpew not found in gamedata (game folder '%s'), console output will not be included in crash reports.", g_pSM->GetGameFolderName());
 			break;
 		}
 
@@ -1205,6 +1535,7 @@ bool Accelerator::SDK_OnLoad(char *error, size_t maxlength, bool late)
 			&& !GetSpewFastcall
 #endif
 		) {
+			spewFailure = "the GetSpew signature scan returned no address";
 			smutils->LogMessage(myself, "WARNING: Sigscan for GetSpew failed, console output will not be included in crash reports.");
 			break;
 		}
@@ -1351,6 +1682,9 @@ bool Accelerator::SDK_OnLoad(char *error, size_t maxlength, bool late)
 
 void Accelerator::SDK_OnUnload()
 {
+	// Before the module is unmapped: tier0 keeps the listener pointer.
+	spewcapture::Uninstall();
+
 	extforwards::Shutdown();
 	plsys->RemovePluginsListener(this);
 
@@ -1479,6 +1813,12 @@ void Accelerator::OnPluginLoaded(IPlugin *plugin)
 	const char *filename = plugin->GetFilename();
 	size_t filenameSize = strlen(filename) + 1;
 
+	// The VM can only name a source line if the .smx carries a .dbg section, so
+	// remember whether this plugin can be resolved at all. Without it a crash
+	// report says "line 0" and we would rather explain that than print it.
+	IPluginDebugInfo *debug = runtime->GetDebugInfo();
+	spstack::RegisterPlugin(context, filename, debug && debug->NumFiles() > 0);
+
 	uint32_t size = 0;
 	size += sizeof(uint32_t); // size
 	size += sizeof(void *); // GetBaseContext
@@ -1533,6 +1873,8 @@ void Accelerator::OnPluginUnloaded(IPlugin *plugin)
 	if (!context) {
 		return;
 	}
+
+	spstack::UnregisterPlugin(context);
 
 	auto it = pluginContextMap.find(context);
 	if (it != pluginContextMap.end()) {
