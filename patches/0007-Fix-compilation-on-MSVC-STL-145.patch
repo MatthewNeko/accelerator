@@ -1,0 +1,39 @@
+diff --git a/src/client/windows/crash_generation/minidump_generator.cc b/src/client/windows/crash_generation/minidump_generator.cc
+index 3811d4a..9618f2e 100644
+--- a/src/client/windows/crash_generation/minidump_generator.cc
++++ b/src/client/windows/crash_generation/minidump_generator.cc
+@@ -36,6 +36,7 @@
+ #include <avrfsdk.h>
+ 
+ #include <algorithm>
++#include <cstring>
+ #include <iterator>
+ #include <list>
+ #include <vector>
+@@ -177,16 +178,16 @@ bool HandleTraceData::CollectHandleData(
+   stream_data->SizeOfEntry = sizeof(AVRF_HANDLE_OPERATION);
+   stream_data->NumberOfEntries = static_cast<ULONG32>(operations_.size());
+   stream_data->Reserved = 0;
+-  std::copy(operations_.begin(),
+-            operations_.end(),
+-#if defined(_MSC_VER) && !defined(_LIBCPP_STD_VER)
+-            stdext::checked_array_iterator<AVRF_HANDLE_OPERATION*>(
+-                reinterpret_cast<AVRF_HANDLE_OPERATION*>(stream_data + 1),
+-                operations_.size())
+-#else
+-            reinterpret_cast<AVRF_HANDLE_OPERATION*>(stream_data + 1)
+-#endif
+-            );
++  if (!operations_.empty()) {
++    // Plain memcpy instead of std::copy: the destination is a bare pointer into
++    // stream_, so MSVC wants stdext::checked_array_iterator to silence its
++    // "unchecked iterator" deprecation - except that MSVC STL 145 (Visual
++    // Studio 18) removed stdext entirely, so that overload no longer compiles.
++    // AVRF_HANDLE_OPERATION is trivially copyable, so a byte copy is equivalent.
++    std::memcpy(stream_data + 1,
++                &operations_.front(),
++                sizeof(AVRF_HANDLE_OPERATION) * operations_.size());
++  }
+ 
+   return true;
+ }
