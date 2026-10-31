@@ -59,11 +59,19 @@ git_reset = AddCwdCommand(builder, git_dir,
   fake_output='git_clean.txt',
   argv=argv)
 
-# Apply each of the patch available to the breakpad repository
+# Apply each of the patch available to the breakpad repository.
+#
+# The fork branch we track (MatthewNeko/breakpad, `accelerator`) sometimes lands
+# our patches/ content directly in the submodule - commit 8bb1668 "update" did
+# that for 0001..0006. A blind `git apply` then reports "patch failed" even
+# though the change is already present, and `--reject` additionally scatters
+# *.rej files around before exiting non-zero, killing the build. apply_patches.py
+# probes the tree first (see the comment at the top of that file) and only
+# applies what is actually missing.
+apply_script = Normalize(os.path.join(builder.currentSourcePath, 'apply_patches.py'))
 argv = [
-  'git',
-  'apply',
-  '--reject'
+  sys.executable,
+  apply_script
 ]
 
 git_patches = []
