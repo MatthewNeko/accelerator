@@ -32,6 +32,7 @@
 #include "sp_stack.h"
 #include "console_tail.h"
 #include "spew_capture.h"
+#include "crash_parse.h"
 
 #if defined _LINUX
 #include "client/linux/handler/exception_handler.h"
@@ -110,9 +111,16 @@ void operator delete[](void *ptr, size_t sz) {
 #include <google_breakpad/processor/stack_frame.h>
 #include <processor/pathname_stripper.h>
 
+#include <stdio.h>
+#include <string.h>
 #include <sstream>
 #include <streambuf>
 #include <memory>
+
+#if defined _WINDOWS
+// unlink() and rename() are the POSIX spellings the dump code uses.
+#include <io.h>
+#endif
 
 Accelerator g_accelerator;
 SMEXT_LINK(&g_accelerator);
@@ -149,6 +157,12 @@ char steamInf[1024];
 char dumpStoragePath[512];
 char logPath[512];
 char crashArchivePath[512];
+// Dumps are moved out of dumpStoragePath before anything reads them, see
+// UploadThread::RunThread. `processing` holds the one being worked on and
+// `bad` holds the ones that have been rejected, so a dump can only ever be
+// parsed once per start.
+char dumpProcessingPath[512];
+char dumpBadPath[512];
 
 // Static, not stack: the Linux dump callback runs on breakpad's alternate
 // signal stack, which is far too small for a report buffer.
@@ -595,21 +609,6 @@ static bool dumpCallback(const wchar_t* dump_path,
 #error Bad platform.
 #endif
 
-class ClogInhibitor
-{
-	std::streambuf *saved_clog = nullptr;
-
-public:
-	ClogInhibitor() {
-		saved_clog = std::clog.rdbuf();
-		std::clog.rdbuf(nullptr);
-	}
-
-	~ClogInhibitor() {
-		std::clog.rdbuf(saved_clog);
-	}
-};
-
 class UploadThread: public IThread
 {
 	FILE *log = nullptr;
@@ -672,6 +671,150 @@ class UploadThread: public IThread
 		}
 	}
 
+	/**
+	 * @brief Creates one of the dump folders if it is not there yet.
+	 *
+	 * @param path	Folder to create.
+	 * @return		True when the folder exists and is a folder.
+	 */
+	bool EnsureFolder(const char *path) {
+		if (libsys->IsPathDirectory(path)) {
+			return true;
+		}
+		if (libsys->CreateFolder(path)) {
+			return true;
+		}
+		g_pSM->LogError(myself, "Failed to create Accelerator crash dump folder: %s", path);
+		return false;
+	}
+
+	/**
+	 * @brief Moves a file into one of the dump folders under a name not yet used.
+	 *
+	 * @param source			File to move.
+	 * @param folder			Destination folder.
+	 * @param destination		Receives the file's new path.
+	 * @param destinationLength	Size of @a destination.
+	 * @return					True when the file is now in @a folder.
+	 */
+	bool MoveIntoFolder(const char *source, const char *folder, char *destination, size_t destinationLength) {
+		const char *base = source + strlen(source);
+		for (const char *p = source; *p; ++p) {
+			if (p[0] == '/' || p[0] == '\\') {
+				base = p + 1;
+			}
+		}
+		if (!base[0]) {
+			destination[0] = '\0';
+			return false;
+		}
+
+		for (int attempt = 0; attempt < 100; ++attempt) {
+			// rename() replaces an existing file on Linux but not on Windows, so
+			// pick a name that is free on both and keep the oldest dump instead of
+			// overwriting the evidence with a newer one.
+			if (attempt == 0) {
+				g_pSM->Format(destination, destinationLength, "%s/%s", folder, base);
+			} else {
+				g_pSM->Format(destination, destinationLength, "%s/%d-%s", folder, attempt, base);
+			}
+
+			if (libsys->PathExists(destination)) {
+				continue;
+			}
+
+			if (rename(source, destination) == 0) {
+				return true;
+			}
+
+			// A failed rename is usually a permission or file-in-use problem, and
+			// another name would fail the same way.
+			break;
+		}
+
+		g_pSM->LogError(myself, "Failed to move %s into %s", source, folder);
+		destination[0] = '\0';
+		return false;
+	}
+
+	/**
+	 * @brief Parks a dump and its report where the next start will not read them.
+	 *
+	 * @param path		Dump to park, may be empty.
+	 * @param metapath	Report sidecar to park, may be empty.
+	 * @param reason	Why the dump is being parked, written to the log.
+	 */
+	void QuarantineDump(const char *path, const char *metapath, const char *reason) {
+		char parked[512];
+
+		if (path && path[0]) {
+			if (MoveIntoFolder(path, dumpBadPath, parked, sizeof(parked))) {
+				g_pSM->LogError(myself, "Accelerator set aside a crash dump it cannot read (%s): %s", reason, parked);
+				if (log) fprintf(log, "Set aside unreadable crash dump %s as %s: %s\n", path, parked, reason);
+			}
+		}
+
+		if (metapath && metapath[0]) {
+			if (MoveIntoFolder(metapath, dumpBadPath, parked, sizeof(parked)) && log) {
+				fprintf(log, "Set aside report %s as %s\n", metapath, parked);
+			}
+		}
+
+		if (log) fflush(log);
+	}
+
+	/**
+	 * @brief Clears out dumps a previous run was reading when it died.
+	 *
+	 * A dump still in `processing` is the one that killed the previous run: the
+	 * parse happens after the move, so anything left there faulted the parser or
+	 * the process before it could be dealt with. Reading it again would repeat
+	 * the crash, which is the restart loop this pass exists to break, so it is
+	 * parked in `bad` for the operator to inspect instead.
+	 */
+	void QuarantineInterruptedDumps() {
+		IDirectory *interrupted = libsys->OpenDirectory(dumpProcessingPath);
+		if (!interrupted) {
+			return;
+		}
+
+		// Collect the names first: moving a file out of the folder being walked
+		// can make the walk skip its neighbours.
+		std::vector<std::string> names;
+		while (interrupted->MoreFiles()) {
+			const char *entryName = interrupted->GetEntryName();
+			if (interrupted->IsEntryFile() && entryName && entryName[0]) {
+				names.push_back(entryName);
+			}
+			interrupted->NextEntry();
+		}
+
+		libsys->CloseDirectory(interrupted);
+
+		int parked = 0;
+		for (size_t index = 0; index < names.size(); ++index) {
+			char path[512];
+			g_pSM->Format(path, sizeof(path), "%s/%s", dumpProcessingPath, names[index].c_str());
+
+			char destination[512];
+			if (MoveIntoFolder(path, dumpBadPath, destination, sizeof(destination))) {
+				parked++;
+				if (log) {
+					fprintf(log, "A previous run died while reading %s; set it aside as %s\n", path, destination);
+				}
+			}
+		}
+
+		if (parked) {
+			g_pSM->LogError(myself,
+				"Accelerator set aside %d crash dump(s) that a previous run died while reading. "
+				"They are not retried automatically; the server will not restart-loop on them again.",
+				parked);
+		}
+
+		if (log) fflush(log);
+	}
+
 	void RunThread(IThreadHandle *pHandle) {
 		rootconsole->ConsolePrint("Accelerator upload thread started.");
 
@@ -680,12 +823,14 @@ class UploadThread: public IThread
 			g_pSM->LogError(myself, "Failed to open Accelerator log file: %s", logPath);
 		}
 
-		if (keepCrashReports && !libsys->IsPathDirectory(crashArchivePath)) {
-			if (!libsys->CreateFolder(crashArchivePath)) {
-				keepCrashReports = false;
-				g_pSM->LogError(myself, "Failed to create Accelerator report archive: %s", crashArchivePath);
-			}
+		if (keepCrashReports && !EnsureFolder(crashArchivePath)) {
+			keepCrashReports = false;
 		}
+
+		// Dumps waiting to be read, and the two places a dump goes instead of
+		// being read twice. Without them there is no way to tell an unreadable
+		// dump apart from one that has not been tried yet.
+		bool canIsolate = EnsureFolder(dumpProcessingPath) && EnsureFolder(dumpBadPath);
 
 		char path[512];
 		g_pSM->Format(path, sizeof(path), "%s/server-id.txt", dumpStoragePath);
@@ -708,32 +853,63 @@ class UploadThread: public IThread
 			}
 		}
 
+		if (canIsolate) {
+			QuarantineInterruptedDumps();
+		}
+
 		IDirectory *dumps = libsys->OpenDirectory(dumpStoragePath);
+		if (!dumps) {
+			g_pSM->LogError(myself, "Failed to open the Accelerator crash dump folder: %s", dumpStoragePath);
+		}
 
 		int skip = 0;
 		int count = 0;
 		int failed = 0;
+		char waitingPath[512];
 		char metapath[512];
 		char presubmitToken[512];
 		char response[512];
 
-		while (dumps->MoreFiles()) {
-			if (!dumps->IsEntryFile()) {
+		// Same reason as above: every dump in this list is moved out of the
+		// folder that is being walked.
+		std::vector<std::string> waiting;
+		if (dumps) {
+			while (dumps->MoreFiles()) {
+				if (dumps->IsEntryFile()) {
+					const char *entryName = dumps->GetEntryName();
+					int entryNameLength = entryName ? strlen(entryName) : 0;
+					if (entryNameLength >= 4 && strcmp(&entryName[entryNameLength-4], ".dmp") == 0) {
+						waiting.push_back(entryName);
+					}
+				}
 				dumps->NextEntry();
-				continue;
 			}
 
-			const char *name = dumps->GetEntryName();
+			libsys->CloseDirectory(dumps);
+		}
 
-			int namelen = strlen(name);
-			if (namelen < 4 || strcmp(&name[namelen-4], ".dmp") != 0) {
-				dumps->NextEntry();
-				continue;
+		for (size_t waitingIndex = 0; waitingIndex < waiting.size(); ++waitingIndex) {
+			const char *name = waiting[waitingIndex].c_str();
+
+			g_pSM->Format(waitingPath, sizeof(waitingPath), "%s/%s", dumpStoragePath, name);
+
+			// Nothing that is about to be read stays in the folder the next start
+			// reads from. If the read fails badly enough to take the process with
+			// it, the file is in `processing` instead and the next start sets it
+			// aside rather than walking into the same fault again.
+			bool isolated = false;
+			if (canIsolate) {
+				isolated = MoveIntoFolder(waitingPath, dumpProcessingPath, path, sizeof(path));
+				if (!isolated) {
+					continue;
+				}
+			} else {
+				g_pSM->Format(path, sizeof(path), "%s", waitingPath);
 			}
 
-			g_pSM->Format(path, sizeof(path), "%s/%s", dumpStoragePath, name);
-			g_pSM->Format(metapath, sizeof(metapath), "%s.txt", path);
-
+			// The report sidecar is written next to the dump by the crash handler
+			// and only the dump moves, so it is still where it was.
+			g_pSM->Format(metapath, sizeof(metapath), "%s.txt", waitingPath);
 			if (!libsys->PathExists(metapath)) {
 				metapath[0] = '\0';
 			}
@@ -744,15 +920,46 @@ class UploadThread: public IThread
 			const char *presubmitOption = g_pSM->GetCoreConfigValue("MinidumpPresubmit");
 			bool canPresubmit = !presubmitOption || (tolower(presubmitOption[0]) == 'y' || presubmitOption[0] == '1');
 
+			// The parser can only be trusted with a dump that is either already
+			// out of the way or read in its own process. Without one of those, a
+			// single bad dump is a server that cannot start, so it is uploaded
+			// without a local signature instead.
+			if (canPresubmit && !isolated && !crashparse::ParseRunsInOwnProcess()) {
+				g_pSM->LogError(myself,
+					"Accelerator will not locally parse %s: it could not be moved aside and this build "
+					"parses in-process, so an unreadable dump could stop the server from starting.",
+					name);
+				canPresubmit = false;
+			}
+
 			if (canPresubmit) {
+				// A dump breakpad cannot read is not the same thing as a dump that
+				// does not exist: check the container before the parser gets it,
+				// and park anything that cannot be a minidump instead of parsing it
+				// on a thread the process cannot survive losing.
+				char invalidReason[256];
+				if (!crashparse::Validate(path, invalidReason, sizeof(invalidReason))) {
+					failed++;
+					QuarantineDump(path, metapath, invalidReason);
+					continue;
+				}
+
 				presubmitResponse = PresubmitCrashDump(path, presubmitToken, sizeof(presubmitToken));
+
+				if (presubmitResponse == kPRLocalError) {
+					// breakpad could not make sense of it, or died trying. Either way
+					// it must not be handed to the parser again on the next start.
+					failed++;
+					g_pSM->LogError(myself, "Accelerator failed to locally process crash dump");
+					if (log) fprintf(log, "Failed to locally process crash dump\n");
+					QuarantineDump(path, metapath, "the local parser rejected it");
+					continue;
+				}
 			}
 
 			switch (presubmitResponse) {
 				case kPRLocalError:
-					failed++;
-					g_pSM->LogError(myself, "Accelerator failed to locally process crash dump");
-					if (log) fprintf(log, "Failed to locally process crash dump");
+					// Handled above; the parser has already run by this point.
 					break;
 				case kPRRemoteError:
 				case kPRUploadCrashDumpAndMetadata:
@@ -785,14 +992,13 @@ class UploadThread: public IThread
 				unlink(metapath);
 			}
 
+			// On the isolated path this is the copy in `processing`, which is also
+			// what has to go: a dump left there is treated as one that killed the
+			// previous run.
 			unlink(path);
 
 			if (log) fflush(log);
-
-			dumps->NextEntry();
 		}
-
-		libsys->CloseDirectory(dumps);
 
 		if (log) {
 			fclose(log);
@@ -808,11 +1014,11 @@ class UploadThread: public IThread
 	}
 
 #if defined _LINUX
-	bool UploadSymbolFile(const google_breakpad::CodeModule *module, const char *presubmitToken) {
+	bool UploadSymbolFile(const crashparse::ModuleInfo &module, const char *presubmitToken) {
 		if (log) fprintf(log, "UploadSymbolFile\n");
 		if (log) fflush(log);
 
-		auto debugFile = module->debug_file();
+		auto debugFile = module.debugFile;
 		std::string vdsoOutputPath = "";
 
 		if (false && debugFile == "linux-gate.so") {
@@ -939,8 +1145,8 @@ class UploadThread: public IThread
 	}
 #endif
 
-	bool UploadModuleFile(const google_breakpad::CodeModule *module, const char *presubmitToken) {
-		const auto &codeFile = module->code_file();
+	bool UploadModuleFile(const crashparse::ModuleInfo &module, const char *presubmitToken) {
+		const auto &codeFile = module.codeFile;
 
 #ifndef WIN32
 		if (codeFile[0] != '/') {
@@ -965,8 +1171,8 @@ class UploadThread: public IThread
 			form->AddString("PresubmitToken", presubmitToken);
 		}
 
-		form->AddString("debug_identifier", module->debug_identifier().c_str());
-		form->AddString("code_identifier", module->code_identifier().c_str());
+		form->AddString("debug_identifier", module.debugIdentifier.c_str());
+		form->AddString("code_identifier", module.codeIdentifier.c_str());
 
 		form->AddFile("code_file", codeFile.c_str());
 
@@ -1061,12 +1267,10 @@ class UploadThread: public IThread
 		return true;
 	}
 
-	ModuleType ClassifyModule(const google_breakpad::CodeModule *module) {
+	ModuleType ClassifyModule(const std::string &codeFile) {
 		if (modulePathMap.empty()) {
 			return kMTUnknown;
 		}
-
-		const auto &codeFile = module->code_file();
 
 #ifndef WIN32
 		if (codeFile == "linux-gate.so") {
@@ -1112,75 +1316,20 @@ class UploadThread: public IThread
 	};
 
 	PresubmitResponse PresubmitCrashDump(const char *path, char *tokenBuffer, size_t tokenBufferLength) {
-		google_breakpad::ProcessState processState;
-		google_breakpad::ProcessResult processResult;
-		google_breakpad::MinidumpProcessor minidumpProcessor(nullptr, nullptr);
-
-		{
-			ClogInhibitor clogInhibitor;
-			processResult = minidumpProcessor.Process(path, &processState);
-		}
-
-		if (processResult != google_breakpad::PROCESS_OK) {
+		// The dump is parsed by crash_parse, which on Linux does it in a child
+		// process: a dump breakpad cannot survive costs that child, not the
+		// server. Everything below works off the copied-out result, so nothing
+		// here depends on breakpad having survived.
+		crashparse::ParseResult dump;
+		if (!crashparse::Parse(path, &dump)) {
+			if (log) {
+				fprintf(log, "Could not process crash dump %s: %s\n", path, dump.failure.c_str());
+			}
 			return kPRLocalError;
 		}
 
-		std::string os_short = "";
-		std::string cpu_arch = "";
-		if (processState.system_info()) {
-			os_short = processState.system_info()->os_short;
-			if (os_short.empty()) {
-				os_short = processState.system_info()->os;
-			}
-			cpu_arch = processState.system_info()->cpu;
-		}
-
-		int requestingThread = processState.requesting_thread();
-		if (requestingThread == -1) {
-			requestingThread = 0;
-		}
-
-		const google_breakpad::CallStack *stack = processState.threads()->at(requestingThread);
-		if (!stack) {
-			return kPRLocalError;
-		}
-
-		int frameCount = stack->frames()->size();
-		if (frameCount > 1024) {
-			frameCount = 1024;
-		}
-
-		std::ostringstream summaryStream;
-		summaryStream << 2 << "|" << processState.time_date_stamp() << "|" << os_short << "|" << cpu_arch << "|" << processState.crashed() << "|" << processState.crash_reason() << "|" << std::hex << processState.crash_address() << std::dec << "|" << requestingThread;
-
-		std::map<const google_breakpad::CodeModule *, unsigned int> moduleMap;
-
-		unsigned int moduleCount = processState.modules() ? processState.modules()->module_count() : 0;
-		for (unsigned int moduleIndex = 0; moduleIndex < moduleCount; ++moduleIndex) {
-			auto module = processState.modules()->GetModuleAtIndex(moduleIndex);
-			moduleMap[module] = moduleIndex;
-
-			auto debugFile = google_breakpad::PathnameStripper::File(module->debug_file());
-			auto debugIdentifier = module->debug_identifier();
-
-			summaryStream << "|M|" << debugFile << "|" << debugIdentifier;
-		}
-
-		for (int frameIndex = 0; frameIndex < frameCount; ++frameIndex) {
-			auto frame = stack->frames()->at(frameIndex);
-
-			int moduleIndex = -1;
-			auto moduleOffset = frame->ReturnAddress();
-			if (frame->module) {
-				moduleIndex = moduleMap[frame->module];
-				moduleOffset -= frame->module->base_address();
-			}
-
-			summaryStream << "|F|" << moduleIndex << "|" << std::hex << moduleOffset << std::dec;
-		}
-
-		auto summaryLine = summaryStream.str();
-		// printf("%s\n", summaryLine.c_str());
+		const char *summaryLine = dump.summary.c_str();
+		unsigned int moduleCount = static_cast<unsigned int>(dump.modules.size());
 
 		IWebForm *form = webternet->CreateForm();
 
@@ -1190,7 +1339,7 @@ class UploadThread: public IThread
 		form->AddString("ExtensionVersion", SMEXT_CONF_VERSION);
 		form->AddString("ServerID", serverId);
 
-		form->AddString("CrashSignature", summaryLine.c_str());
+		form->AddString("CrashSignature", summaryLine);
 
 		MemoryDownloader data;
 		IWebTransfer *xfer = webternet->CreateSession();
@@ -1264,8 +1413,7 @@ class UploadThread: public IThread
 		}
 
 		if (moduleCount > 0) {
-			auto mainModule = processState.modules()->GetMainModule();
-			auto executableBaseDir = PathnameStripper_Directory(mainModule->code_file());
+			auto executableBaseDir = PathnameStripper_Directory(dump.mainModuleCodeFile);
 			InitModuleClassificationMap(executableBaseDir);
 
 			// 0 = Disabled
@@ -1292,10 +1440,10 @@ class UploadThread: public IThread
 				if (log) fprintf(log, "Getting module at index %d\n", moduleIndex);
 				if (log) fflush(log);
 
-				auto module = processState.modules()->GetModuleAtIndex(moduleIndex);
+				const crashparse::ModuleInfo &moduleInfo = dump.modules[moduleIndex];
 
-				auto moduleType = ClassifyModule(module);
-				if (log) fprintf(log, "Classified module %s as %s\n", module->code_file().c_str(), ModuleTypeCode[moduleType]);
+				auto moduleType = ClassifyModule(moduleInfo.codeFile);
+				if (log) fprintf(log, "Classified module %s as %s\n", moduleInfo.codeFile.c_str(), ModuleTypeCode[moduleType]);
 				if (log) fflush(log);
 				switch (moduleType) {
 					case kMTUnknown:
@@ -1319,12 +1467,12 @@ class UploadThread: public IThread
 				}
 
 				if (canBinarySubmit && submitBinary) {
-					UploadModuleFile(module, tokenBuffer);
+					UploadModuleFile(moduleInfo, tokenBuffer);
 				}
 
 #if defined _LINUX
 				if (submitSymbols) {
-					UploadSymbolFile(module, tokenBuffer);
+					UploadSymbolFile(moduleInfo, tokenBuffer);
 				}
 #endif
 			}
@@ -1476,6 +1624,8 @@ bool Accelerator::SDK_OnLoad(char *error, size_t maxlength, bool late)
 
 	g_pSM->BuildPath(Path_SM, logPath, sizeof(logPath), "logs/accelerator.log");
 	g_pSM->BuildPath(Path_SM, crashArchivePath, sizeof(crashArchivePath), "data/dumps/archive");
+	g_pSM->BuildPath(Path_SM, dumpProcessingPath, sizeof(dumpProcessingPath), "data/dumps/processing");
+	g_pSM->BuildPath(Path_SM, dumpBadPath, sizeof(dumpBadPath), "data/dumps/bad");
 
 	// Core config knobs, both on by default (cfg/sourcemod/sourcemod.cfg, "Core" section).
 	const char* stackOption = g_pSM->GetCoreConfigValue("CrashPluginStack");
@@ -1495,8 +1645,9 @@ bool Accelerator::SDK_OnLoad(char *error, size_t maxlength, bool late)
 	strncpy(crashSourceModPath, g_pSM->GetSourceModPath(), sizeof(crashSourceModPath) - 1);
 	strncpy(crashGameDirectory, g_pSM->GetGameFolderName(), sizeof(crashGameDirectory) - 1);
 
-	threader->MakeThread(&uploadThread);
-	threader->MakeThread(&spNotifyThread); // This thread waits for accelator to be done uploading and for the first OnMapStart call, then fires a SourceMod forward
+	// The upload thread is started further down, after the crash handler is
+	// installed: a fault in it then becomes a crash report with its metadata
+	// instead of a bare engine dump of a thread the operator cannot identify.
 
 	do {
 		char gameconfigError[256];
@@ -1564,6 +1715,9 @@ bool Accelerator::SDK_OnLoad(char *error, size_t maxlength, bool late)
 #else
 #error Bad platform.
 #endif
+
+	threader->MakeThread(&uploadThread);
+	threader->MakeThread(&spNotifyThread); // This thread waits for accelator to be done uploading and for the first OnMapStart call, then fires a SourceMod forward
 
 	do {
 		char spJitPath[512];

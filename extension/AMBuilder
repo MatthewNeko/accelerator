@@ -12,6 +12,7 @@ project.sources = [
   'sp_stack.cpp',
   'console_tail.cpp',
   'spew_capture.cpp',
+  'crash_parse.cpp',
   os.path.join(Accelerator.sm_root, 'public', 'smsdk_ext.cpp')
 ]
 
