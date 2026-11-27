@@ -1704,6 +1704,16 @@ bool Accelerator::SDK_OnLoad(char *error, size_t maxlength, bool late)
 #elif defined _WINDOWS
 	wchar_t *buf = new wchar_t[sizeof(dumpStoragePath)];
 	size_t num_chars = mbstowcs(buf, dumpStoragePath, sizeof(dumpStoragePath));
+	if (num_chars == static_cast<size_t>(-1)) {
+		// The path cannot be expressed in the active locale's wide encoding, so
+		// there is no directory to write dumps to. Say so rather than hand
+		// breakpad a name built from an uninitialised buffer, which would send
+		// every dump to whatever directory the server happens to be in.
+		num_chars = 0;
+		smutils->LogMessage(myself,
+			"WARNING: The crash dump folder could not be converted to a wide path, "
+			"crash dumps will be written to the server's working directory: %s", dumpStoragePath);
+	}
 
 	handler = new google_breakpad::ExceptionHandler(
 		std::wstring(buf, num_chars), NULL, dumpCallback, NULL, google_breakpad::ExceptionHandler::HANDLER_ALL,
@@ -1711,7 +1721,7 @@ bool Accelerator::SDK_OnLoad(char *error, size_t maxlength, bool late)
 
 	vectoredHandler = AddVectoredExceptionHandler(0, BreakpadVectoredHandler);
 
-	delete buf;
+	delete[] buf;
 #else
 #error Bad platform.
 #endif
